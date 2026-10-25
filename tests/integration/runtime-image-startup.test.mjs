@@ -1138,21 +1138,20 @@ const environment = {
   APP_SERVER_TOKEN: "synthetic-transport-token", APP_SERVER_PORT: "4500",
 };
 let native;
-vm.runInNewContext(${JSON.stringify(AGENT_RUNTIME_ENTRYPOINT)}, {
+const startup = vm.runInNewContext(${JSON.stringify(AGENT_RUNTIME_ENTRYPOINT)}, {
   URL, console, setTimeout, setInterval,
   process: { env: environment, on() {}, exit() {} },
   require(name) {
     if (name !== "node:child_process") return require(name);
     return {
-      spawnSync(_command, args) {
-        return args.includes("login") ? { status: 0 } : {
-          status: 0,
-          stdout: [
+      spawnSync() { return { status: 0 }; },
+      execFile(_command, _args, _options, callback) {
+        queueMicrotask(() => callback(null, [
             { type: "turn.started" },
             { type: "item.completed", item: { type: "agent_message", text: "READY" } },
             { type: "turn.completed" },
-          ].map(JSON.stringify).join("\\n"),
-        };
+          ].map(JSON.stringify).join("\\n"), ""));
+        return { stdin: { end() {} } };
       },
       spawn(command, args, options) {
         const appServer = args.indexOf("app-server");
@@ -1165,6 +1164,8 @@ vm.runInNewContext(${JSON.stringify(AGENT_RUNTIME_ENTRYPOINT)}, {
     };
   },
 });
+(async () => {
+await startup;
 assert.ok(native);
 const pending = new Map();
 let nextId = 1;
@@ -1207,6 +1208,7 @@ const timeout = setTimeout(() => { native.kill("SIGKILL"); process.exitCode = 1;
     lines.close();
     native.kill("SIGTERM");
   }
+})().catch((error) => { console.error(error); process.exitCode = 1; });
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 `;
     const { stdout } = await runDocker([
@@ -2254,21 +2256,20 @@ const homeControlSentinel = "synthetic-openclaw-control-sentinel\\n";
 fs.writeFileSync(homeControlSentinelPath, homeControlSentinel, { mode: 0o600 });
 assert.equal(fs.readFileSync(homeControlSentinelPath, "utf8"), homeControlSentinel);
 let native;
-vm.runInNewContext(${JSON.stringify(AGENT_RUNTIME_ENTRYPOINT)}, {
+const startup = vm.runInNewContext(${JSON.stringify(AGENT_RUNTIME_ENTRYPOINT)}, {
   URL, console, setTimeout, setInterval,
   process: { env: environment, on() {}, exit() {} },
   require(name) {
     if (name !== "node:child_process") return require(name);
     return {
-      spawnSync(_command, args) {
-        return args.includes("login") ? { status: 0 } : {
-          status: 0,
-          stdout: [
+      spawnSync() { return { status: 0 }; },
+      execFile(_command, _args, _options, callback) {
+        queueMicrotask(() => callback(null, [
             { type: "turn.started" },
             { type: "item.completed", item: { type: "agent_message", text: "READY" } },
             { type: "turn.completed" },
-          ].map(JSON.stringify).join("\\n"),
-        };
+          ].map(JSON.stringify).join("\\n"), ""));
+        return { stdin: { end() {} } };
       },
       spawn(command, args, options) {
         const appServer = args.indexOf("app-server");
@@ -2281,6 +2282,8 @@ vm.runInNewContext(${JSON.stringify(AGENT_RUNTIME_ENTRYPOINT)}, {
     };
   },
 });
+(async () => {
+await startup;
 assert.ok(native);
 const pending = new Map();
 let nextId = 1;
@@ -2385,6 +2388,7 @@ const timeout = setTimeout(() => {
     native.kill("SIGTERM");
   }
 })().catch((error) => { console.error(error); console.error(stderr); process.exitCode = 1; });
+})().catch((error) => { console.error(error); process.exitCode = 1; });
 `;
     let stdout;
     try {
@@ -3080,15 +3084,9 @@ test(
   },
 );
 
-// Kubernetes sends SIGTERM and waits the termination grace period before
-// SIGKILL. The wrapper is PID 1, so a signal it has no handler for is ignored.
-// On main the Codex wrapper installs no SIGTERM handler during its blocking
-// probe or while it holds a failure, so both cases below wait for SIGKILL
-// (verified on the runtime image). The images lane fails on any skipped test,
-// so these cases stay unregistered until the fix on branch
-// fix/runtime-pid1-sigterm lands; that change sets this flag and adds both
-// names to scripts/ci/test-suites/images-packaging.json.
-const runtimeWrapperEndsOnSigterm = false;
+// Kubernetes sends SIGTERM to PID 1 before escalating to SIGKILL. Both startup
+// states must exit cleanly without waiting for that escalation.
+const runtimeWrapperEndsOnSigterm = true;
 
 async function terminateWrapper(containerName) {
   const signalledAt = Date.now();

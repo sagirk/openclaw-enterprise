@@ -44,6 +44,25 @@ const CODEX_ASANA_APP_ID = "asdk_app_asana";
 const PLUGIN_APP_SERVER_TOKEN_DOMAIN = "openclaw-plugin-runtime/app-server-token/v1";
 const nodeRequire = createRequire(import.meta.url);
 
+// Supply the same fixture CLI results through Node's asynchronous execFile
+// contract; the production probe still parses and classifies every result.
+function asynchronousCodexFixture(native) {
+  return {
+    ...native,
+    execFile(command, args, options, callback) {
+      const result = native.spawnSync(command, args, options);
+      const error =
+        result.error?.code === "ETIMEDOUT"
+          ? { code: null, signal: "SIGKILL", killed: true }
+          : result.error || result.status !== 0
+            ? { code: result.status, signal: result.signal, killed: false, ...result.error }
+            : null;
+      queueMicrotask(() => callback(error, result.stdout ?? "", result.stderr ?? ""));
+      return { stdin: { end() {} } };
+    },
+  };
+}
+
 function plain(value) {
   return JSON.parse(JSON.stringify(value));
 }
@@ -2996,7 +3015,7 @@ test("Codex runtime gates startup and readiness on a successful native authentic
     },
   ];
   for (const scenario of scenarios) {
-    await t.test(scenario.name, () => {
+    await t.test(scenario.name, async () => {
       const directory = mkdtempSync(join(tmpdir(), "openclaw-plugin-ready-"));
       const marker = join(directory, "ready");
       writeFileSync(marker, "stale\n", { mode: 0o600 });
@@ -3069,7 +3088,7 @@ test("Codex runtime gates startup and readiness on a successful native authentic
               };
             }
             if (specifier === "node:child_process") {
-              return {
+              return asynchronousCodexFixture({
                 spawnSync(command, args, options) {
                   nativeCalls++;
                   const isLogin = args.includes("login");
@@ -3130,12 +3149,12 @@ test("Codex runtime gates startup and readiness on a successful native authentic
                   appServerStarts++;
                   return { on() {}, kill() {} };
                 },
-              };
+              });
             }
             return nodeRequire(specifier);
           },
         };
-        vm.runInNewContext(AGENT_RUNTIME_ENTRYPOINT, sandbox);
+        await vm.runInNewContext(AGENT_RUNTIME_ENTRYPOINT, sandbox);
         if (scenario.probeTimeouts) {
           assert.equal(appServerStarts, 0);
           assert.equal(existsSync(marker), false);
@@ -3143,7 +3162,7 @@ test("Codex runtime gates startup and readiness on a successful native authentic
           assert.equal(retryTimers.length, 1);
           assert.equal(retryTimers[0].delay, 1000);
           clock += scenario.retryDelayMs ?? 1000;
-          retryTimers[0].callback();
+          await retryTimers[0].callback();
           assert.equal(retryTimers.length, 1, "exhaustion must not schedule another retry");
         } else {
           assert.equal(retryTimers.length, 0);
@@ -3235,7 +3254,7 @@ test("Codex runtime gates startup and readiness on a successful native authentic
   }
 });
 
-test("Codex agent app-server uses a per-startup plugin status token", () => {
+test("Codex agent app-server uses a per-startup plugin status token", async () => {
   const directory = mkdtempSync(join(tmpdir(), "oce-plugin-token-"));
   const marker = join(directory, "ready");
   const baseToken = "capability-token-test-value";
@@ -3306,7 +3325,7 @@ test("Codex agent app-server uses a per-startup plugin status token", () => {
         }
         if (specifier === "node:child_process") {
           let nativeCalls = 0;
-          return {
+          return asynchronousCodexFixture({
             spawnSync() {
               nativeCalls += 1;
               return nativeCalls === 1
@@ -3330,13 +3349,13 @@ test("Codex agent app-server uses a per-startup plugin status token", () => {
               appServerSpawn = { command, args };
               return { on() {}, kill() {} };
             },
-          };
+          });
         }
         return nodeRequire(specifier);
       },
     };
 
-    vm.runInNewContext(AGENT_RUNTIME_ENTRYPOINT, sandbox);
+    await vm.runInNewContext(AGENT_RUNTIME_ENTRYPOINT, sandbox);
 
     assert.ok(statusHandler);
     assert.equal(appServerSpawn.command, "codex");

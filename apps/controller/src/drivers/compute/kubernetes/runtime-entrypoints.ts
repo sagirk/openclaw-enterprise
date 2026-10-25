@@ -2392,12 +2392,28 @@ if (followsPeerStatus) {
 export const AGENT_RUNTIME_ENTRYPOINT = String.raw`
 const { createHash } = require("node:crypto");
 const { mkdirSync, mkdtempSync, rmSync } = require("node:fs");
-const { spawn, spawnSync } = require("node:child_process");
+const { execFile, spawn, spawnSync } = require("node:child_process");
 const { performance } = require("node:perf_hooks");
 
 ${PLUGIN_RUNTIME_HELPERS}
 ${AUTH_PROBE_FAILURE_HELPER}
 ${startupPhaseHelper("agent")}
+// PID 1 must handle termination even before an app-server exists.
+let codexChild;
+let terminating = false;
+function forwardTermination(signal) {
+  if (terminating) return;
+  terminating = true;
+  const child = codexChild;
+  if (child === undefined) {
+    process.exit(0);
+    return;
+  }
+  child.kill(signal);
+  setTimeout(() => child.kill("SIGKILL"), 8_000).unref();
+}
+process.on("SIGTERM", () => forwardTermination("SIGTERM"));
+process.on("SIGINT", () => forwardTermination("SIGINT"));
 startPluginRuntimeStatusServer();
 const loginMode = process.env.CODEX_LOGIN_MODE;
 const apiKey = process.env.OPENAI_API_KEY;
@@ -2484,7 +2500,7 @@ function isRecoveredNativeStreamError(event) {
   return !/auth|unauthori[sz]ed|forbidden|credential|api.?key|\b40[13]\b/i.test(event.message);
 }
 
-function probeCodexAuthentication(timeout) {
+async function probeCodexAuthentication(timeout) {
   let result;
   const finish = (code) => ({
     code,
@@ -2506,7 +2522,8 @@ function probeCodexAuthentication(timeout) {
       "sleep_tool", "goals", "workspace_dependencies", "skill_search",
       "skill_mcp_dependency_install", "tool_suggest", "recommended_plugins", "request_permissions_tool",
     ];
-    result = spawnSync("codex", [
+    result = await new Promise((resolve) => {
+      codexChild = execFile("codex", [
       ...disabled.flatMap((feature) => ["--disable", feature]),
       "-a", "never", "exec", "--ephemeral", "--ignore-user-config", "--ignore-rules",
       "--skip-git-repo-check", "--json", "--sandbox", "read-only", "--cd", directory,
@@ -2535,7 +2552,23 @@ function probeCodexAuthentication(timeout) {
       },
       encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
       timeout, killSignal: "SIGKILL", maxBuffer: 262144,
+      }, (error, stdout, stderr) => {
+        codexChild = undefined;
+        resolve({
+          status: error ? (Number.isInteger(error.code) ? error.code : null) : 0,
+          signal: error?.signal,
+          // execFile distinguishes its timeout kill from an external signal
+          // (killed=false) and output overflow (a named error code).
+          error: error?.killed && error.signal === "SIGKILL" && error.code === null
+            ? { code: "ETIMEDOUT" }
+            : error,
+          stdout,
+          stderr,
+        });
+      });
+      codexChild.stdin.end();
     });
+    if (terminating) return finish();
     const output = result.stdout?.trim() ?? "";
     const events = output === "" ? [] : output.split("\n").map((line) => JSON.parse(line));
     // A failed turn caused by provider 401/403 is a deterministic credential
@@ -2580,8 +2613,8 @@ function probeCodexAuthentication(timeout) {
 }
 
 // A single startup budget includes both process attempts and the retry delay.
-// No signal handler is installed during backoff, so termination exits promptly.
-function startAuthenticatedCodex(attempt = 1, deadline = performance.now() + 61000) {
+// The early termination handler also covers backoff and held failures.
+async function startAuthenticatedCodex(attempt = 1, deadline = performance.now() + 61000) {
   const startedAt = performance.now();
   const timeout = Math.min(30000, Math.floor(deadline - startedAt));
   if (timeout <= 0) {
@@ -2589,7 +2622,11 @@ function startAuthenticatedCodex(attempt = 1, deadline = performance.now() + 610
     holdFailedAuthentication("model-probe", "MODEL_PROBE_TIMEOUT");
     return;
   }
-  const result = probeCodexAuthentication(timeout);
+  const result = await probeCodexAuthentication(timeout);
+  if (terminating) {
+    process.exit(0);
+    return;
+  }
   console.error(JSON.stringify({
     event: "codex.model_probe",
     attempt,
@@ -2608,18 +2645,6 @@ function startAuthenticatedCodex(attempt = 1, deadline = performance.now() + 610
     return;
   }
   logStartupPhase("model-probe", modelProbeStartedAt);
-
-function forwardTermination(child) {
-  let terminating = false;
-  const forward = (signal) => {
-    if (terminating) return;
-    terminating = true;
-    child.kill(signal);
-    setTimeout(() => child.kill("SIGKILL"), 8_000).unref();
-  };
-  process.on("SIGTERM", () => forward("SIGTERM"));
-  process.on("SIGINT", () => forward("SIGINT"));
-}
 
 if (pluginRuntimeStatusPort() !== undefined) {
   process.env.APP_SERVER_TOKEN = derivePluginAppServerToken(pluginStatusReport.startupId);
@@ -2653,7 +2678,7 @@ const child = spawn(
   ],
   { stdio: "inherit", cwd: "/home/node/workspace" },
 );
-forwardTermination(child);
+codexChild = child;
 child.on("exit", (code, signal) => process.exit(code ?? (signal === "SIGTERM" ? 0 : 1)));
 (async () => {
   try {

@@ -1,7 +1,7 @@
 ---
 created: 2026-08-24
-updated: 2026-09-28
-last_updated_session: authoring-run/3b7cc615-9e7b-416a-aec7-fe13c38cace1
+updated: 2026-10-24
+last_updated_session: authoring-run/aab7da2d-3fe8-4fc2-aae3-4e3613c48da6
 ---
 
 # Harness Authentication Binding Flow
@@ -50,6 +50,9 @@ graph TD
   Q -->|no| K["Candidate remains unready"]
   J -->|login or nonretryable failure| K
   J -->|yes| L["Runtime readiness and guarded activation"]
+  J -->|termination| U["Stop probe and exit zero without retry"]
+  P -->|termination| U
+  K -->|termination| U
   H --> M{"Native primary model probe succeeds?"}
   M -->|no| N["Gateway stays unready; replacement may interrupt service"]
   M -->|yes| O["Gateway becomes ready; complete activation"]
@@ -168,8 +171,13 @@ state remains in the bounded ephemeral home.
 attempts within one monotonic 61-second budget. Only the subprocess's
 `ETIMEDOUT` result schedules the second attempt after a one-second timer; an
 unexplained `SIGKILL` is a nonretryable failure. The next process timeout is the
-smaller of 30 seconds and the remaining budget. No termination handler is
-installed during the delay, so stopping the launcher prevents the second call.
+smaller of 30 seconds and the remaining budget. The wrapper installs SIGTERM and
+SIGINT handlers before startup and tracks the current probe or app-server child.
+The model probe uses asynchronous `execFile`, so termination can interrupt it.
+The handler forwards the signal and retains the eight-second SIGKILL fallback;
+probe completion removes temporary state, then exits zero without publishing an
+outcome or retrying. With no child during backoff or a held failure, the wrapper
+exits zero immediately. App-server shutdown keeps its existing exit-code mapping.
 Only successful validation starts the app-server and publishes readiness.
 
 Embedded OpenClaw consumes the selected provider's native API key and runs one bounded native
@@ -198,6 +206,12 @@ consumer, verify a real turn, then revoke the previous key upstream. Revision
 history cannot restore historical Secret values.
 
 ## Debugging and Verification
+
+- The two SIGTERM cases in `tests/integration/runtime-image-startup.test.mjs`
+  run the generated Codex wrapper as PID 1 without an init. They require the
+  selected runtime image and Docker; a stand-in TLS provider holds a model turn
+  or rejects authentication. They check clean termination, no retry or readiness,
+  and abandonment of the in-flight request, not external provider acceptance.
 
 - [Container launcher tests](../testing/docker.md#verify-codex-startup-probe-recovery)
   execute the generated launcher with a fixture CLI, real process timeouts,
@@ -232,6 +246,8 @@ history cannot restore historical Secret values.
 [keep this for the user to add notes. do not change between edits]
 
 ## Changelog
+
+- 2026-10-24 23:17: Handle Codex PID 1 termination during asynchronous model probing, backoff, and held failures. (authoring-run/aab7da2d-3fe8-4fc2-aae3-4e3613c48da6 - 0a86c836cb73e9f80910d3b6cdc72f9d1fb568a1)
 
 - 2026-09-28 18:45: Document bounded Codex model-probe recovery and sanitized attempt evidence in the accompanying change. (authoring-run/3b7cc615-9e7b-416a-aec7-fe13c38cace1 - a14435c81e0d4020dd24568babddf95aba533da7)
 

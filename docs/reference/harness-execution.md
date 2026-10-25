@@ -158,7 +158,11 @@ native output without logging its contents. Dedicated Codex retries a confirmed
 subprocess timeout once after one second. Each attempt has a 30-second cap within
 one 61-second budget, including the delay. Authentication rejection, malformed
 output, tool events, and external signals without timeout evidence do not retry.
-Termination during the delay exits without starting another probe. Exhausted or
+The PID 1 Codex wrapper handles SIGTERM and SIGINT during its asynchronous model
+probe, retry delay, and held failure. Termination abandons an in-flight probe
+without publishing its outcome or retrying; the wrapper exits with status zero.
+A running probe or app-server receives the signal and an eight-second SIGKILL
+fallback. App-server exit status handling remains unchanged. Exhausted or
 nonretryable failure holds the process unready until restart; readiness polling
 never starts another model call. Embedded OpenClaw continues to probe once.
 
